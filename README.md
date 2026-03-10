@@ -22,6 +22,39 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
+## 网络要求
+
+**中国大陆用户需要配置代理：**
+
+### 方式一：环境变量（推荐）
+
+```bash
+# Windows PowerShell
+$env:HTTP_PROXY="http://127.0.0.1:7890"
+$env:HTTPS_PROXY="http://127.0.0.1:7890"
+
+# Linux/Mac
+export HTTP_PROXY="http://127.0.0.1:7890"
+export HTTPS_PROXY="http://127.0.0.1:7890"
+```
+
+### 方式二：.env 文件
+
+在项目目录下创建 `.env` 文件：
+
+```
+HTTP_PROXY=http://127.0.0.1:7890
+HTTPS_PROXY=http://127.0.0.1:7890
+```
+
+### 方式三：永久设置（系统环境变量）
+
+1. 搜索"环境变量"
+2. 用户变量 → 新建
+3. `HTTP_PROXY = http://127.0.0.1:你的代理端口`
+4. `HTTPS_PROXY = http://127.0.0.1:你的代理端口`
+5. 重启终端
+
 ## 使用
 
 ### 安装为可执行模块（推荐）
