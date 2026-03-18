@@ -1,5 +1,6 @@
 """Main GUI application for Qwen Token acquisition."""
 
+import os
 import threading
 from typing import Optional
 
@@ -50,6 +51,26 @@ class App(ctk.CTk):
         # Controls
         ctrl = ctk.CTkFrame(self, fg_color="transparent")
         ctrl.pack(fill="x", padx=20, pady=(0, 10))
+
+        # Email provider select
+        provider_frame = ctk.CTkFrame(ctrl, fg_color="transparent")
+        provider_frame.pack(side="left", padx=(0, 15))
+
+        provider_label = ctk.CTkLabel(provider_frame, text="临时邮箱")
+        provider_label.pack(side="left", padx=(0, 8))
+
+        # Env: AUTO_REGISTER_EMAIL_PROVIDER = "mailtm" | "1secmail"
+        default_provider = os.environ.get("AUTO_REGISTER_EMAIL_PROVIDER", "mailtm").lower().strip() or "mailtm"
+        if default_provider not in ("mailtm", "1secmail"):
+            default_provider = "mailtm"
+        self._email_provider_var = ctk.StringVar(value=default_provider)
+        provider_menu = ctk.CTkOptionMenu(
+            provider_frame,
+            values=["mailtm", "1secmail"],
+            variable=self._email_provider_var,
+            width=120,
+        )
+        provider_menu.pack(side="left")
 
         self._headless_var = ctk.BooleanVar(value=False)
         headless_cb = ctk.CTkCheckBox(
@@ -121,6 +142,8 @@ class App(ctk.CTk):
         if self._running:
             return
         self._running = True
+        # Apply provider selection to current process (used by providers.get_email_provider).
+        os.environ["AUTO_REGISTER_EMAIL_PROVIDER"] = (self._email_provider_var.get() or "mailtm").strip()
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._log.clear()

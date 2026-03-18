@@ -4,22 +4,21 @@ import os
 import random
 import re
 import string
+import tempfile
 import time
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 import httpx
-
-# Environment: AUTO_REGISTER_EMAIL_PROVIDER = "mailtm" | "1secmail"
-_PROVIDER = os.environ.get("AUTO_REGISTER_EMAIL_PROVIDER", "mailtm").lower()
-
 
 def get_email_provider(
     poll_interval: float = 5.0,
     timeout: float = 120.0,
 ):
     """Get the configured temporary email provider."""
-    if _PROVIDER == "1secmail":
+    provider = os.environ.get("AUTO_REGISTER_EMAIL_PROVIDER", "mailtm").lower().strip()
+    if provider == "1secmail":
         return OneSecMailProvider(poll_interval=poll_interval, timeout=timeout)
     return MailTmProvider(poll_interval=poll_interval, timeout=timeout)
 
@@ -155,6 +154,29 @@ class OneSecMailProvider:
         self._poll_interval = poll_interval
         self._timeout = timeout
         self._domains: list[str] = []
+        self._generated_in_session: set[str] = set()
+        self._cache_path = os.environ.get(
+            "AUTO_REGISTER_EMAIL_CACHE_PATH",
+            os.path.join(tempfile.gettempdir(), "auto_register_used_emails.txt"),
+        )
+
+    def _load_used_cache(self) -> set[str]:
+        try:
+            if not os.path.exists(self._cache_path):
+                return set()
+            with open(self._cache_path, encoding="utf-8") as f:
+                return {line.strip().lower() for line in f if line.strip()}
+        except Exception:
+            return set()
+
+    def _append_used_cache(self, email: str) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+            with open(self._cache_path, "a", encoding="utf-8") as f:
+                f.write(email.lower().strip() + "\n")
+        except Exception:
+            # Cache is best-effort; ignore failures.
+            pass
 
     def _request(self, action: str, params: Optional[dict[str, Any]] = None) -> Any:
         """Make API request with browser-like headers."""
@@ -173,11 +195,38 @@ class OneSecMailProvider:
         return self._domains
 
     def generate_email(self) -> str:
-        """Generate a random temporary email address."""
+        """Generate a random temporary email address.
+
+        Note: 1secMail addresses are not reserved/created. To reduce collisions with
+        previously used addresses (by anyone), we:
+        - generate a stronger-unique login (uuid-based + random suffix)
+        - avoid reuse within the same run
+        - keep a best-effort local cache across runs
+        - optionally reject addresses that already have inbox messages
+        """
         domains = self._get_domains()
-        login = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
-        domain = random.choice(domains)
-        return f"{login}@{domain}"
+        used = self._load_used_cache()
+        # Try multiple times to avoid collisions / previously used inboxes.
+        for _ in range(30):
+            # 16 hex + 4 random = 20 chars, still valid for 1secMail login.
+            login = (uuid.uuid4().hex[:16] + "".join(random.choices(string.digits, k=4))).lower()
+            domain = random.choice(domains)
+            email = f"{login}@{domain}".lower()
+            if email in self._generated_in_session or email in used:
+                continue
+            # If the inbox already has messages, it's likely a reused address; reject it.
+            try:
+                inbox = self._request("getMessages", params={"login": login, "domain": domain})
+                if inbox:
+                    continue
+            except Exception:
+                # If inbox check fails (network/403), still allow using the email.
+                pass
+
+            self._generated_in_session.add(email)
+            self._append_used_cache(email)
+            return email
+        raise RuntimeError("1secMail: failed to generate a unique email after many attempts")
 
     def wait_for_activation_link(
         self,
