@@ -1,5 +1,6 @@
 """Temporary email providers. Supports Mail.tm (default) and 1secMail."""
 
+import json
 import os
 import random
 import re
@@ -18,6 +19,8 @@ def get_email_provider(
 ):
     """Get the configured temporary email provider."""
     provider = os.environ.get("AUTO_REGISTER_EMAIL_PROVIDER", "mailtm").lower().strip()
+    if provider in ("cloudflare", "cloudmail", "mailcraft"):
+        return CloudMailProvider(poll_interval=poll_interval, timeout=timeout)
     if provider == "1secmail":
         return OneSecMailProvider(poll_interval=poll_interval, timeout=timeout)
     return MailTmProvider(poll_interval=poll_interval, timeout=timeout)
@@ -291,3 +294,164 @@ class OneSecMailProvider:
             msg.get("htmlBody") or msg.get("textBody") or msg.get("body") or ""
         )
         return _extract_activation_url_from_text(text)
+
+
+class CloudMailProvider:
+    """Provider for self-hosted Cloud Mail API (mailcraft)."""
+
+    def __init__(self, poll_interval: float = 5.0, timeout: float = 120.0):
+        self._poll_interval = poll_interval
+        self._timeout = timeout
+        base_url = os.environ.get("CLOUDFLARE_TEMP_EMAIL_BASE_URL", "").strip()
+        if not base_url:
+            raise RuntimeError("CLOUDFLARE_TEMP_EMAIL_BASE_URL is required for cloudmail provider")
+        self._base_url = base_url.rstrip("/")
+
+        self._admin_email = os.environ.get("ADMIN_EMAIL", "").strip()
+        if not self._admin_email:
+            raise RuntimeError("ADMIN_EMAIL is required for cloudmail provider")
+
+        self._admin_password = self._resolve_admin_password()
+        if not self._admin_password:
+            raise RuntimeError("ADMIN_PASSWORD or ADMIN_PASSWORDS is required for cloudmail provider")
+
+        domain = os.environ.get("CLOUDFLARE_TEMP_EMAIL_DOMAIN", "").strip().lower()
+        if domain:
+            self._domain = domain
+        elif "@" in self._admin_email:
+            self._domain = self._admin_email.split("@", 1)[1].lower()
+        else:
+            raise RuntimeError("Cannot infer temp email domain, set CLOUDFLARE_TEMP_EMAIL_DOMAIN")
+
+        self._token: Optional[str] = None
+
+    def _resolve_admin_password(self) -> str:
+        """Resolve admin password from ADMIN_PASSWORD or ADMIN_PASSWORDS."""
+        plain = os.environ.get("ADMIN_PASSWORD", "").strip()
+        if plain:
+            return plain
+
+        passwords = os.environ.get("ADMIN_PASSWORDS", "").strip()
+        if not passwords:
+            return ""
+
+        try:
+            parsed = json.loads(passwords)
+            if isinstance(parsed, list) and parsed:
+                return str(parsed[0]).strip()
+        except Exception:
+            pass
+
+        cleaned = passwords.strip().strip("[]")
+        if not cleaned:
+            return ""
+        first = cleaned.split(",", 1)[0].strip().strip('"').strip("'")
+        return first
+
+    def _request(
+        self,
+        path: str,
+        payload: Optional[dict[str, Any]] = None,
+        with_auth: bool = False,
+    ) -> dict[str, Any]:
+        """Send POST request to Cloud Mail API and validate response."""
+        headers = {"Content-Type": "application/json"}
+        if with_auth:
+            headers["Authorization"] = self._get_token()
+
+        with httpx.Client(timeout=30) as client:
+            r = client.post(f"{self._base_url}{path}", json=payload or {}, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+
+        code = data.get("code")
+        if code != 200:
+            message = data.get("message") or "unknown error"
+            raise RuntimeError(f"CloudMail API error {code}: {message}")
+        return data
+
+    def _get_token(self) -> str:
+        """Get or refresh admin token."""
+        if self._token:
+            return self._token
+        data = self._request(
+            "/api/public/genToken",
+            payload={"email": self._admin_email, "password": self._admin_password},
+        )
+        token = ((data.get("data") or {}).get("token") or "").strip()
+        if not token:
+            raise RuntimeError("CloudMail genToken returned empty token")
+        self._token = token
+        return token
+
+    def _random_email(self) -> str:
+        login = "qwen" + uuid.uuid4().hex[:10]
+        return f"{login}@{self._domain}"
+
+    def generate_email(self) -> str:
+        """Create an inbox user via addUser and return the email address."""
+        for _ in range(20):
+            email = self._random_email().lower()
+            try:
+                self._request(
+                    "/api/public/addUser",
+                    payload={"list": [{"email": email}]},
+                    with_auth=True,
+                )
+                return email
+            except Exception:
+                continue
+        raise RuntimeError("CloudMail: failed to add user after multiple attempts")
+
+    def wait_for_activation_link(
+        self,
+        email: str,
+        subject_contains: Optional[str] = None,
+        from_contains: Optional[str] = None,
+    ) -> str:
+        """Poll emailList endpoint and extract activation url."""
+        start = time.time()
+        seen_ids: set[int] = set()
+
+        while (time.time() - start) < self._timeout:
+            data = self._request(
+                "/api/public/emailList",
+                payload={
+                    "toEmail": email,
+                    "type": 0,
+                    "isDel": 0,
+                    "timeSort": "desc",
+                    "num": 1,
+                    "size": 20,
+                },
+                with_auth=True,
+            )
+            items = data.get("data") or []
+            for msg in items:
+                msg_id = msg.get("emailId")
+                if msg_id in seen_ids:
+                    continue
+
+                subj = (msg.get("subject") or "").lower()
+                from_email = (msg.get("sendEmail") or "").lower()
+                from_name = (msg.get("sendName") or "").lower()
+                if subject_contains and subject_contains.lower() not in subj:
+                    continue
+                if from_contains:
+                    f = from_contains.lower()
+                    if f not in from_email and f not in from_name:
+                        continue
+
+                seen_ids.add(msg_id)
+                text = (
+                    msg.get("content")
+                    or msg.get("text")
+                    or ""
+                )
+                url = _extract_activation_url_from_text(str(text))
+                if url:
+                    return url
+
+            time.sleep(self._poll_interval)
+
+        raise TimeoutError(f"No activation email received within {self._timeout}s for {email}")

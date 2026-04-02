@@ -1,5 +1,6 @@
-"""File writers for auth profiles, etc."""
+"""Writer package placeholder.
 
-from .auth_profiles_writer import AuthProfilesWriter
+Legacy auth profile writer has been moved to archive/legacy.
+"""
 
-__all__ = ["AuthProfilesWriter"]
+__all__: list[str] = []

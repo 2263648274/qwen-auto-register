@@ -42,7 +42,7 @@ class App(ctk.CTk):
 
         desc = ctk.CTkLabel(
             self,
-            text="注册 → 激活 → 登录 → 提取 Token → 写入 auth-profiles.json",
+            text="注册 → 激活 → 远程登录链接认证（CLI Proxy API）",
             font=ctk.CTkFont(size=12),
             text_color="gray",
         )
@@ -59,14 +59,14 @@ class App(ctk.CTk):
         provider_label = ctk.CTkLabel(provider_frame, text="临时邮箱")
         provider_label.pack(side="left", padx=(0, 8))
 
-        # Env: AUTO_REGISTER_EMAIL_PROVIDER = "mailtm" | "1secmail"
+        # Env: AUTO_REGISTER_EMAIL_PROVIDER = "mailtm" | "1secmail" | "cloudflare"
         default_provider = os.environ.get("AUTO_REGISTER_EMAIL_PROVIDER", "mailtm").lower().strip() or "mailtm"
-        if default_provider not in ("mailtm", "1secmail"):
+        if default_provider not in ("mailtm", "1secmail", "cloudflare"):
             default_provider = "mailtm"
         self._email_provider_var = ctk.StringVar(value=default_provider)
         provider_menu = ctk.CTkOptionMenu(
             provider_frame,
-            values=["mailtm", "1secmail"],
+            values=["mailtm", "1secmail", "cloudflare"],
             variable=self._email_provider_var,
             width=120,
         )
@@ -178,7 +178,7 @@ class App(ctk.CTk):
             self._log.append(f"错误: {error}")
         if success:
             self._log.append("")
-            self._log.append("✅ 完成！auth-profiles.json 已更新，可直接使用 OpenClaw。")
+            self._log.append("✅ 完成！注册激活流程已完成。")
         else:
             self._log.append("")
             self._log.append("❌ 流程未完成，请检查上方日志。")
