@@ -63,7 +63,8 @@ class MailTmProvider:
             if not domains:
                 raise RuntimeError("Mail.tm: no domains available")
             domain = random.choice(domains)
-            login = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+            from src.auto_register.providers.username_provider import generate_random_username
+            login = generate_random_username(prefix="neutral")
             self._password = "".join(random.choices(string.ascii_letters + string.digits, k=16))
             address = f"{login}@{domain}"
             r2 = client.post(
@@ -385,7 +386,8 @@ class CloudMailProvider:
         return token
 
     def _random_email(self) -> str:
-        login = "qwen" + uuid.uuid4().hex[:10]
+        from src.auto_register.providers.username_provider import generate_random_username
+        login = generate_random_username(prefix="neutral")
         return f"{login}@{self._domain}"
 
     def generate_email(self) -> str:

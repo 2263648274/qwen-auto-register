@@ -318,7 +318,7 @@ class QwenPortalRunner:
     def _do_register(self, page: Page, creds: QwenCredentials) -> None:
         """Fill and submit registration form."""
         self._log("3. 打开注册页并填写表单")
-        page.goto(self.REGISTER_URL, wait_until="domcontentloaded", timeout=30000)
+        page.goto(self.REGISTER_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
 
         # 用户名（第一个文本输入框，或 placeholder 含「用户」）

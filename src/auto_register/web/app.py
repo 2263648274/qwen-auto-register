@@ -139,12 +139,31 @@ def _run_flow(run_id: int, req: StartRequest) -> None:
             STATE.append_log(f"\n[Web] ========== 第 {iteration_num}/{loop_count} 次运行 ==========")
             
             try:
-                runner = QwenPortalRunner(
-                    headless=req.headless, 
-                    on_step=STATE.append_log,
-                    check_stop=lambda: STATE.stop_requested  # 传递停止检查回调
-                )
-                ok = runner.run()
+                # 为每次循环启动一个全新的独立线程，防止 Playwright 状态/事件循环在连续调用时被重用而导致超时
+                import threading
+                
+                result = {"ok": False, "error": None, "traceback": None}
+                def _run_single_iteration():
+                    try:
+                        runner = QwenPortalRunner(
+                            headless=req.headless, 
+                            on_step=STATE.append_log,
+                            check_stop=lambda: STATE.stop_requested
+                        )
+                        result["ok"] = runner.run()
+                    except Exception as e:
+                        result["error"] = e
+                        import traceback
+                        result["traceback"] = traceback.format_exc()
+                
+                t = threading.Thread(target=_run_single_iteration, daemon=True)
+                t.start()
+                t.join()  # 等待本次循环的独立线程完全结束
+                
+                if result["error"]:
+                    raise Exception(f"{result['error']}\n{result['traceback']}")
+                
+                ok = result["ok"]
                 
                 if ok:
                     total_success += 1
