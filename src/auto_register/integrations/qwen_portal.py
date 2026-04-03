@@ -53,9 +53,11 @@ class QwenPortalRunner:
         self,
         headless: bool = False,
         on_step: Optional[Callable[[str], None]] = None,
+        check_stop: Optional[Callable[[], bool]] = None,
     ):
         self._headless = headless
         self._on_step = on_step or (lambda _: None)
+        self._check_stop = check_stop or (lambda: False)
         self._latest_creds: Optional[QwenCredentials] = None
 
     def _log(self, msg: str) -> None:
@@ -123,6 +125,11 @@ class QwenPortalRunner:
 
     def run(self) -> bool:
         """Execute full flow. Returns True on success."""
+        # 检查停止信号
+        if self._check_stop():
+            self._log("[Portal] 任务已被停止")
+            return False
+            
         mail_provider = get_email_provider(poll_interval=5.0, timeout=120.0)
         creds = QwenCredentials(
             username=UsernameProvider().get(),
@@ -139,10 +146,25 @@ class QwenPortalRunner:
             page = context.new_page()
 
             try:
+                # 在流程中多点检查停止信号
+                if self._check_stop():
+                    self._log("[Portal] 在打开浏览器后收到停止请求，放弃此次注册")
+                    return False
+                    
                 self._do_register(page, creds)
                 self._log("4. 已提交注册，等待激活邮件...")
+                
+                if self._check_stop():
+                    self._log("[Portal] 在等待邮件前收到停止请求，放弃此次注册")
+                    return False
+                    
                 activation_url = mail_provider.wait_for_activation_link(creds.email)
                 self._log("5. 收到激活邮件")
+                
+                if self._check_stop():
+                    self._log("[Portal] 在激活前收到停止请求，放弃此次注册")
+                    return False
+                    
                 page.goto(activation_url, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(3000)
                 self._log("6. 已打开激活链接")
@@ -153,6 +175,10 @@ class QwenPortalRunner:
                         f"7. 模式 {mode} 不在远程链接模式列表中，按当前项目默认强制切换到 cli-proxy-api-remote"
                     )
 
+                if self._check_stop():
+                    self._log("[Portal] 在启动认证前收到停止请求，放弃此次注册")
+                    return False
+                    
                 self._log("8. 启动远程管理 API 登录链接流程...")
                 ok = self._run_remote_proxy_link_auth(page, creds)
                 if ok:

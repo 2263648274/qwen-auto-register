@@ -130,15 +130,20 @@ def _run_flow(run_id: int, req: StartRequest) -> None:
         total_failed = 0
 
         for iteration in range(loop_count):
+            # 在每次迭代开始前检查停止信号
             if STATE.stop_requested:
-                STATE.append_log(f"[Web] 已收到停止请求，中止循环")
+                STATE.append_log(f"[Web] ⚠ 已收到停止请求，中止循环执行")
                 break
 
             iteration_num = iteration + 1
             STATE.append_log(f"\n[Web] ========== 第 {iteration_num}/{loop_count} 次运行 ==========")
             
             try:
-                runner = QwenPortalRunner(headless=req.headless, on_step=STATE.append_log)
+                runner = QwenPortalRunner(
+                    headless=req.headless, 
+                    on_step=STATE.append_log,
+                    check_stop=lambda: STATE.stop_requested  # 传递停止检查回调
+                )
                 ok = runner.run()
                 
                 if ok:
@@ -151,19 +156,30 @@ def _run_flow(run_id: int, req: StartRequest) -> None:
             except Exception as e:
                 total_failed += 1
                 STATE.append_log(f"[Web] ✗ 第 {iteration_num} 次运行异常: {e}")
+                import traceback
+                STATE.append_log(f"[Web] 详细: {traceback.format_exc()}")
 
-            # 循环间隔
+            # 在循环间隔中频繁检查停止信号
             if iteration_num < loop_count:
                 STATE.append_log(f"[Web] 等待 5 秒后开始下一次...")
                 for i in range(5):
                     if STATE.stop_requested:
+                        STATE.append_log(f"[Web] ⚠ 在循环间隔检测到停止请求，将立即中止")
                         break
                     import time
                     time.sleep(1)
+                
+                # 再次检查，确保停止请求被及时响应
+                if STATE.stop_requested:
+                    STATE.append_log(f"[Web] ⚠ 停止请求已生效，中止循环执行")
+                    break
 
         # 最终结果
         STATE.append_log(f"\n[Web] ========== 循环结束 ==========")
         STATE.append_log(f"[Web] 成功: {total_success}, 失败: {total_failed}")
+        
+        if STATE.stop_requested:
+            STATE.append_log(f"[Web] 任务已被用户中止")
         
         all_success = total_failed == 0 and total_success > 0
         STATE.finish_run(
@@ -173,6 +189,8 @@ def _run_flow(run_id: int, req: StartRequest) -> None:
 
     except Exception as e:
         STATE.append_log(f"[Web] 运行异常: {e}")
+        import traceback
+        STATE.append_log(f"[Web] 详细: {traceback.format_exc()}")
         STATE.finish_run(ok=False, error=str(e))
 
 
@@ -346,7 +364,7 @@ def create_app() -> FastAPI:
             <button id="btnStop" class="btn-danger" disabled>停止</button>
         </div>
 
-        <div id="proxyModal" style="display:none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
+        <div id="proxyModal" style="display:none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; justify-content: center; align-items: center;">
             <div style="background: white; padding: 24px; border-radius: 12px; width: 90%; max-width: 500px; max-height: 80vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.3);">
                 <h2 style="margin: 0 0 16px 0; font-size: 20px;">代理配置</h2>
                 <div style="margin-bottom: 16px;">
@@ -384,258 +402,283 @@ def create_app() -> FastAPI:
     </div>
 
     <script>
-        const btnStart = document.getElementById('btnStart');
-        const btnStop = document.getElementById('btnStop');
-        const btnConfigProxy = document.getElementById('btnConfigProxy');
-        const statusIcon = document.getElementById('statusIcon');
-        const statusText = document.getElementById('statusText');
-        const logsDiv = document.getElementById('logs');
-        const provider = document.getElementById('provider');
-        const headless = document.getElementById('headless');
-        const loopCount = document.getElementById('loopCount');
+        // 等待 DOM 完全加载
+        function initUI() {
+            const btnStart = document.getElementById('btnStart');
+            const btnStop = document.getElementById('btnStop');
+            const btnConfigProxy = document.getElementById('btnConfigProxy');
+            const statusIcon = document.getElementById('statusIcon');
+            const statusText = document.getElementById('statusText');
+            const logsDiv = document.getElementById('logs');
+            const provider = document.getElementById('provider');
+            const headless = document.getElementById('headless');
+            const loopCount = document.getElementById('loopCount');
 
-        // 代理配置 UI
-        const proxyModal = document.getElementById('proxyModal');
-        const proxyServer = document.getElementById('proxyServer');
-        const proxyUsername = document.getElementById('proxyUsername');
-        const proxyPassword = document.getElementById('proxyPassword');
-        const proxyBypass = document.getElementById('proxyBypass');
-        const btnProxySave = document.getElementById('btnProxySave');
-        const btnProxyCancel = document.getElementById('btnProxyCancel');
-        const btnProxyClear = document.getElementById('btnProxyClear');
+            // 代理配置 UI - 确保都存在
+            const proxyModal = document.getElementById('proxyModal');
+            const proxyServer = document.getElementById('proxyServer');
+            const proxyUsername = document.getElementById('proxyUsername');
+            const proxyPassword = document.getElementById('proxyPassword');
+            const proxyBypass = document.getElementById('proxyBypass');
+            const btnProxySave = document.getElementById('btnProxySave');
+            const btnProxyCancel = document.getElementById('btnProxyCancel');
+            const btnProxyClear = document.getElementById('btnProxyClear');
 
-        let isRunning = false;
-        let currentRunId = 0;
+            let isRunning = false;
+            let currentRunId = 0;
 
-        function hasCoreElements() {
-            return !!(btnStart && btnStop && statusIcon && statusText && logsDiv && provider && headless && loopCount);
-        }
-
-        // 从 localStorage 加载代理配置
-        function loadProxyConfig() {
-            try {
-                const saved = localStorage.getItem('proxyConfig');
-                if (saved) {
-                    const config = JSON.parse(saved);
-                    proxyServer.value = config.server || '';
-                    proxyUsername.value = config.username || '';
-                    proxyPassword.value = config.password || '';
-                    proxyBypass.value = config.bypass || '';
+            function hasCoreElements() {
+                const hasCore = !!(btnStart && btnStop && statusIcon && statusText && logsDiv && provider && headless && loopCount);
+                const hasProxy = !!(proxyModal && proxyServer && proxyUsername && proxyPassword && proxyBypass && btnProxySave && btnProxyCancel && btnProxyClear);
+                if (!hasCore || !hasProxy) {
+                    console.error('缺少 DOM 元素：', { hasCore, hasProxy });
                 }
-            } catch (e) {
-                console.error('Failed to load proxy config:', e);
+                return hasCore && hasProxy;
             }
-        }
 
-        // 保存代理配置
-        function saveProxyConfig() {
-            const config = {
-                server: proxyServer.value.trim(),
-                username: proxyUsername.value.trim(),
-                password: proxyPassword.value.trim(),
-                bypass: proxyBypass.value.trim(),
-            };
-            localStorage.setItem('proxyConfig', JSON.stringify(config));
-        }
+            if (!hasCoreElements()) {
+                console.error('Web UI 初始化失败：缺少关键 DOM 元素');
+                return;
+            }
 
-        if (btnConfigProxy && proxyModal) {
-            btnConfigProxy.addEventListener('click', () => {
+            // 从 localStorage 加载代理配置
+            function loadProxyConfig() {
+                try {
+                    const saved = localStorage.getItem('proxyConfig');
+                    if (saved) {
+                        const config = JSON.parse(saved);
+                        proxyServer.value = config.server || '';
+                        proxyUsername.value = config.username || '';
+                        proxyPassword.value = config.password || '';
+                        proxyBypass.value = config.bypass || '';
+                    }
+                } catch (e) {
+                    console.error('Failed to load proxy config:', e);
+                }
+            }
+
+            // 保存代理配置
+            function saveProxyConfig() {
+                const config = {
+                    server: proxyServer.value.trim(),
+                    username: proxyUsername.value.trim(),
+                    password: proxyPassword.value.trim(),
+                    bypass: proxyBypass.value.trim(),
+                };
+                localStorage.setItem('proxyConfig', JSON.stringify(config));
+            }
+
+            // 代理配置按钮事件 - 修复并简化绑定方式
+            btnConfigProxy.addEventListener('click', (e) => {
+                e.preventDefault();
+                console.log('打开代理配置对话框');
                 loadProxyConfig();
                 proxyModal.style.display = 'flex';
             });
-        }
 
-        if (btnProxySave && proxyModal) {
-            btnProxySave.addEventListener('click', () => {
+            btnProxySave.addEventListener('click', (e) => {
+                e.preventDefault();
+                console.log('保存代理配置');
                 saveProxyConfig();
                 proxyModal.style.display = 'none';
             });
-        }
 
-        if (btnProxyCancel && proxyModal) {
-            btnProxyCancel.addEventListener('click', () => {
+            btnProxyCancel.addEventListener('click', (e) => {
+                e.preventDefault();
+                console.log('取消代理配置');
                 proxyModal.style.display = 'none';
             });
-        }
 
-        if (btnProxyClear && proxyModal) {
-            btnProxyClear.addEventListener('click', () => {
+            btnProxyClear.addEventListener('click', (e) => {
+                e.preventDefault();
                 if (confirm('确定要清除所有代理配置吗？')) {
-                    if (proxyServer) proxyServer.value = '';
-                    if (proxyUsername) proxyUsername.value = '';
-                    if (proxyPassword) proxyPassword.value = '';
-                    if (proxyBypass) proxyBypass.value = '';
+                    console.log('清除代理配置');
+                    proxyServer.value = '';
+                    proxyUsername.value = '';
+                    proxyPassword.value = '';
+                    proxyBypass.value = '';
                     localStorage.removeItem('proxyConfig');
                     proxyModal.style.display = 'none';
                 }
             });
-        }
 
-        // 点击模态框外关闭
-        if (proxyModal) {
+            // 点击模态框外关闭
             proxyModal.addEventListener('click', (e) => {
                 if (e.target === proxyModal) {
+                    console.log('点击对话框外，关闭');
                     proxyModal.style.display = 'none';
                 }
             });
-        }
 
-        function setStatus(text, state) {
-            statusText.textContent = text;
-            statusIcon.className = 'status-icon ' + state;
-        }
-
-        function appendLog(message, type = 'info') {
-            if (logsDiv.textContent === '等待启动...') {
-                logsDiv.textContent = '';
+            function setStatus(text, state) {
+                statusText.textContent = text;
+                statusIcon.className = 'status-icon ' + state;
             }
-            const line = document.createElement('div');
-            line.className = 'log-line log-' + type;
-            const stamp = new Date().toLocaleTimeString('zh-CN');
-            line.textContent = `[${stamp}] ${message}`;
-            logsDiv.appendChild(line);
-            logsDiv.scrollTop = logsDiv.scrollHeight;
-        }
 
-        function clearLogs() {
-            logsDiv.textContent = '等待启动...';
-        }
-
-        async function updateStatus() {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                
-                if (data.running) {
-                    setStatus(`运行中 (ID: ${data.run_id})`, 'running');
-                    isRunning = true;
-                    btnStart.disabled = true;
-                    btnStop.disabled = false;
-                    btnConfigProxy.disabled = true;
-                } else {
-                    btnStart.disabled = false;
-                    btnStop.disabled = true;
-                    btnConfigProxy.disabled = false;
-                    isRunning = false;
-                    
-                    if (data.success === true) {
-                        setStatus(`✓ 已完成 (ID: ${data.run_id})`, 'success');
-                    } else if (data.success === false) {
-                        setStatus(`✗ 失败: ${data.error || '未知错误'}`, 'error');
-                    } else {
-                        setStatus('待机', 'idle');
-                    }
+            function appendLog(message, type = 'info') {
+                if (logsDiv.textContent === '等待启动...') {
+                    logsDiv.textContent = '';
                 }
-
-                // 更新日志
-                const logs = data.logs || [];
-                if (logs.length > 0) {
-                    logsDiv.innerHTML = '';
-                    logs.forEach(logLine => {
-                        const line = document.createElement('div');
-                        line.className = 'log-line';
-                        // 根据内容类型着色
-                        if (logLine.includes('成功') || logLine.includes('✓')) {
-                            line.classList.add('log-success');
-                        } else if (logLine.includes('失败') || logLine.includes('错误') || logLine.includes('✗')) {
-                            line.classList.add('log-error');
-                        } else if (logLine.includes('警告')) {
-                            line.classList.add('log-warn');
-                        }
-                        line.textContent = logLine;
-                        logsDiv.appendChild(line);
-                    });
-                    logsDiv.scrollTop = logsDiv.scrollHeight;
-                } else if (!data.running) {
-                    logsDiv.textContent = '等待启动...';
-                }
-            } catch (e) {
-                setStatus(`状态获取失败: ${e.message}`, 'error');
-            }
-        }
-
-        if (!hasCoreElements()) {
-            console.error('Web UI 初始化失败: 缺少关键 DOM 元素');
-        }
-
-        btnStart.addEventListener('click', async () => {
-            clearLogs();
-            appendLog('正在启动任务...', 'info');
-            setStatus('启动中...', 'running');
-            btnStart.disabled = true;
-            btnStop.disabled = true;
-            if (btnConfigProxy) btnConfigProxy.disabled = true;
-
-            // 获取代理配置
-            let proxyConfig = null;
-            try {
-                proxyConfig = JSON.parse(localStorage.getItem('proxyConfig') || '{}');
-            } catch (e) {
-                proxyConfig = {};
+                const line = document.createElement('div');
+                line.className = 'log-line log-' + type;
+                const stamp = new Date().toLocaleTimeString('zh-CN');
+                line.textContent = `[${stamp}] ${message}`;
+                logsDiv.appendChild(line);
+                logsDiv.scrollTop = logsDiv.scrollHeight;
             }
 
-            try {
-                const res = await fetch('/api/start', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        headless: headless.checked,
-                        email_provider: provider.value || null,
-                        loop_count: parseInt(loopCount.value) || 1,
-                        proxy_server: proxyConfig.server || null,
-                        proxy_username: proxyConfig.username || null,
-                        proxy_password: proxyConfig.password || null,
-                        proxy_bypass: proxyConfig.bypass || null,
-                    }),
-                });
+            function clearLogs() {
+                logsDiv.textContent = '等待启动...';
+            }
 
-                if (res.ok) {
+            async function updateStatus() {
+                try {
+                    const res = await fetch('/api/status');
                     const data = await res.json();
-                    currentRunId = data.run_id;
-                    appendLog(`任务已启动 (ID: ${data.run_id})`, 'success');
-                    isRunning = true;
-                    btnStop.disabled = false;
-                } else {
-                    const error = await res.text();
-                    appendLog(`启动失败: ${error}`, 'error');
-                    setStatus('启动失败', 'error');
+                    
+                    if (data.running) {
+                        setStatus(`运行中 (ID: ${data.run_id})`, 'running');
+                        isRunning = true;
+                        btnStart.disabled = true;
+                        btnStop.disabled = false;
+                        btnConfigProxy.disabled = true;
+                    } else {
+                        btnStart.disabled = false;
+                        btnStop.disabled = true;
+                        btnConfigProxy.disabled = false;
+                        isRunning = false;
+                        
+                        if (data.success === true) {
+                            setStatus(`✓ 已完成 (ID: ${data.run_id})`, 'success');
+                        } else if (data.success === false) {
+                            setStatus(`✗ 失败: ${data.error || '未知错误'}`, 'error');
+                        } else {
+                            setStatus('待机', 'idle');
+                        }
+                    }
+
+                    // 更新日志
+                    const logs = data.logs || [];
+                    if (logs.length > 0) {
+                        logsDiv.innerHTML = '';
+                        logs.forEach(logLine => {
+                            const line = document.createElement('div');
+                            line.className = 'log-line';
+                            // 根据内容类型着色
+                            if (logLine.includes('成功') || logLine.includes('✓')) {
+                                line.classList.add('log-success');
+                            } else if (logLine.includes('失败') || logLine.includes('错误') || logLine.includes('✗') || logLine.includes('异常')) {
+                                line.classList.add('log-error');
+                            } else if (logLine.includes('警告') || logLine.includes('停止')) {
+                                line.classList.add('log-warn');
+                            }
+                            line.textContent = logLine;
+                            logsDiv.appendChild(line);
+                        });
+                        logsDiv.scrollTop = logsDiv.scrollHeight;
+                    } else if (!data.running) {
+                        logsDiv.textContent = '等待启动...';
+                    }
+                } catch (e) {
+                    console.error('获取状态失败:', e);
+                    setStatus(`状态获取失败: ${e.message}`, 'error');
+                }
+            }
+
+            btnStart.addEventListener('click', async () => {
+                console.log('点击启动按钮');
+                clearLogs();
+                appendLog('正在启动任务...', 'info');
+                setStatus('启动中...', 'running');
+                btnStart.disabled = true;
+                btnStop.disabled = true;
+                btnConfigProxy.disabled = true;
+
+                // 获取代理配置
+                let proxyConfig = null;
+                try {
+                    proxyConfig = JSON.parse(localStorage.getItem('proxyConfig') || '{}');
+                } catch (e) {
+                    proxyConfig = {};
+                }
+
+                try {
+                    const res = await fetch('/api/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            headless: headless.checked,
+                            email_provider: provider.value || null,
+                            loop_count: parseInt(loopCount.value) || 1,
+                            proxy_server: proxyConfig.server || null,
+                            proxy_username: proxyConfig.username || null,
+                            proxy_password: proxyConfig.password || null,
+                            proxy_bypass: proxyConfig.bypass || null,
+                        }),
+                    });
+
+                    if (res.ok) {
+                        const data = await res.json();
+                        currentRunId = data.run_id;
+                        appendLog(`任务已启动 (ID: ${data.run_id})`, 'success');
+                        isRunning = true;
+                        btnStop.disabled = false;
+                    } else {
+                        const error = await res.text();
+                        appendLog(`启动失败: ${error}`, 'error');
+                        setStatus('启动失败', 'error');
+                        btnStart.disabled = false;
+                        btnConfigProxy.disabled = false;
+                    }
+                } catch (e) {
+                    console.error('启动异常:', e);
+                    appendLog(`启动异常: ${e.message}`, 'error');
+                    setStatus('启动异常', 'error');
                     btnStart.disabled = false;
-                    if (btnConfigProxy) btnConfigProxy.disabled = false;
+                    btnConfigProxy.disabled = false;
                 }
-            } catch (e) {
-                appendLog(`启动异常: ${e.message}`, 'error');
-                setStatus('启动异常', 'error');
-                btnStart.disabled = false;
-                if (btnConfigProxy) btnConfigProxy.disabled = false;
-            }
-        });
+            });
 
-        btnStop.addEventListener('click', async () => {
-            appendLog('正在停止任务...', 'warn');
-            btnStop.disabled = true;
+            btnStop.addEventListener('click', async () => {
+                console.log('点击停止按钮');
+                appendLog('正在停止任务...', 'warn');
+                btnStop.disabled = true;
 
-            try {
-                const res = await fetch('/api/stop', { method: 'POST' });
-                if (res.ok) {
-                    appendLog('停止请求已发送', 'info');
-                } else {
-                    appendLog('停止失败', 'error');
+                try {
+                    const res = await fetch('/api/stop', { method: 'POST' });
+                    if (res.ok) {
+                        const data = await res.json();
+                        appendLog('停止信号已发送，任务将在当前步骤完成后停止', 'warn');
+                        console.log('停止响应:', data);
+                    } else {
+                        appendLog(`停止请求失败: HTTP ${res.status}`, 'error');
+                        console.error('停止失败，状态码:', res.status);
+                    }
+                } catch (e) {
+                    console.error('停止异常:', e);
+                    appendLog(`停止异常: ${e.message}`, 'error');
                 }
-            } catch (e) {
-                appendLog(`停止异常: ${e.message}`, 'error');
-            }
-        });
+            });
 
-        window.addEventListener('error', (event) => {
-            if (statusText) {
-                statusText.textContent = `前端脚本异常: ${event.message}`;
-                statusIcon.className = 'status-icon error';
-            }
-        });
+            window.addEventListener('error', (event) => {
+                console.error('前端脚本异常:', event);
+                if (statusText) {
+                    statusText.textContent = `前端脚本异常: ${event.message}`;
+                    statusIcon.className = 'status-icon error';
+                }
+            });
 
-        // 定期更新状态和日志
-        setInterval(updateStatus, 1000);
-        updateStatus();
+            // 定期更新状态和日志（1秒间隔）
+            setInterval(updateStatus, 1000);
+            updateStatus();
+        }
+
+        // 文档加载完成后初始化
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initUI);
+        } else {
+            initUI();
+        }
     </script>
 </body>
 </html>"""
