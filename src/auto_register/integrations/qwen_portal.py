@@ -1,20 +1,15 @@
-"""Qwen registration + login + token extraction runner."""
+"""Qwen registration + activation runner with remote auth-link handoff."""
 
 import os
 import string
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable, Optional
 
 from playwright.sync_api import Page, sync_playwright
 
+from .cli_proxy_management_client import get_qwen_auth_url, list_auth_files, poll_auth_status
 from ..providers.one_sec_mail_provider import get_email_provider
 from ..providers.username_provider import UsernameProvider
-from ..utils.gateway import restart_openclaw_gateway
-from ..utils.token_utils import is_valid_jwt, validate_tokens
-from ..writer.auth_profiles_writer import AuthProfilesWriter
-from .qwen_oauth_client import run_device_code_flow
 
 
 @dataclass
@@ -41,107 +36,302 @@ def _generate_password(length: int = 14) -> str:
 
 
 class QwenPortalRunner:
-    """Run full Qwen flow: register -> activate -> login -> extract token -> write."""
+    """Run simplified flow: register -> activate -> remote auth-link handoff."""
 
     REGISTER_URL = "https://chat.qwen.ai/auth?mode=register"
-    LOGIN_URL = "https://chat.qwen.ai/auth"
+
+    PROXY_LINK_AUTH_MODES = (
+        "cli-proxy-api-remote",
+        "cli_proxy_api_remote",
+        "proxy-link",
+        "proxy_link",
+        "management-api",
+        "management_api",
+    )
 
     def __init__(
         self,
         headless: bool = False,
-        auth_profiles_path: Optional[Path] = None,
         on_step: Optional[Callable[[str], None]] = None,
+        check_stop: Optional[Callable[[], bool]] = None,
     ):
         self._headless = headless
-        self._writer = AuthProfilesWriter(path=auth_profiles_path)
         self._on_step = on_step or (lambda _: None)
+        self._check_stop = check_stop or (lambda: False)
+        self._latest_creds: Optional[QwenCredentials] = None
 
     def _log(self, msg: str) -> None:
         self._on_step(msg)
 
+    def _current_url(self, page: Page) -> str:
+        """Return current page URL for diagnostics."""
+        try:
+            return page.url or "<empty-url>"
+        except Exception:
+            return "<unknown-url>"
+
+    def _auth_mode(self) -> str:
+        return (
+            os.environ.get("QWEN_AUTH_MODE")
+            or os.environ.get("AUTO_REGISTER_AUTH_MODE")
+            or "cli-proxy-api-remote"
+        ).strip().lower()
+
+    def _resolve_browser_proxy(self) -> Optional[dict]:
+        """Resolve Playwright proxy from env for browser automation."""
+        proxy_server = (
+            os.environ.get("QWEN_PLAYWRIGHT_PROXY")
+            or os.environ.get("PLAYWRIGHT_PROXY")
+            or os.environ.get("HTTPS_PROXY")
+            or os.environ.get("HTTP_PROXY")
+            or ""
+        ).strip()
+        if not proxy_server:
+            return None
+
+        proxy: dict = {"server": proxy_server}
+
+        bypass = (
+            os.environ.get("QWEN_PLAYWRIGHT_PROXY_BYPASS")
+            or os.environ.get("NO_PROXY")
+            or ""
+        ).strip()
+        if bypass:
+            proxy["bypass"] = bypass
+
+        username = (os.environ.get("QWEN_PLAYWRIGHT_PROXY_USERNAME") or "").strip()
+        password = (os.environ.get("QWEN_PLAYWRIGHT_PROXY_PASSWORD") or "").strip()
+        if username:
+            proxy["username"] = username
+        if password:
+            proxy["password"] = password
+
+        return proxy
+
+    def _browser_launch_options(self) -> dict:
+        """Build Chromium launch options with optional proxy support."""
+        options = {"headless": self._headless}
+        proxy = self._resolve_browser_proxy()
+        if proxy:
+            options["proxy"] = proxy
+            server = str(proxy.get("server") or "")
+            self._log(f"[Browser] 已启用代理: {server}")
+            bypass = str(proxy.get("bypass") or "").strip()
+            if bypass:
+                self._log(f"[Browser] 代理绕过列表: {bypass}")
+        else:
+            self._log("[Browser] 未配置 Playwright 代理，直连访问")
+        return options
+
     def run(self) -> bool:
         """Execute full flow. Returns True on success."""
+        # 检查停止信号
+        if self._check_stop():
+            self._log("[Portal] 任务已被停止")
+            return False
+            
         mail_provider = get_email_provider(poll_interval=5.0, timeout=120.0)
         creds = QwenCredentials(
             username=UsernameProvider().get(),
             email=mail_provider.generate_email(),
             password=_generate_password(),
         )
+        self._latest_creds = creds
         self._log(f"1. 临时邮箱: {creds.email}")
         self._log(f"2. 随机密码已生成")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self._headless)
+            browser = p.chromium.launch(**self._browser_launch_options())
             context = browser.new_context()
             page = context.new_page()
 
             try:
+                # 在流程中多点检查停止信号
+                if self._check_stop():
+                    self._log("[Portal] 在打开浏览器后收到停止请求，放弃此次注册")
+                    return False
+                    
                 self._do_register(page, creds)
                 self._log("4. 已提交注册，等待激活邮件...")
-                activation_url = mail_provider.wait_for_activation_link(creds.email)
+                
+                if self._check_stop():
+                    self._log("[Portal] 在等待邮件前收到停止请求，放弃此次注册")
+                    return False
+                    
+                activation_url = mail_provider.wait_for_activation_link(creds.email, check_stop=self._check_stop)
+                if not activation_url:
+                    self._log("[Portal] 等待邮件时收到停止请求或超时")
+                    return False
+                
                 self._log("5. 收到激活邮件")
+                
+                if self._check_stop():
+                    self._log("[Portal] 在激活前收到停止请求，放弃此次注册")
+                    return False
+                    
                 page.goto(activation_url, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(3000)
                 self._log("6. 已打开激活链接")
+                mode = self._auth_mode()
+                self._log(f"7. 当前认证模式: {mode}")
+                if mode not in self.PROXY_LINK_AUTH_MODES:
+                    self._log(
+                        f"7. 模式 {mode} 不在远程链接模式列表中，按当前项目默认强制切换到 cli-proxy-api-remote"
+                    )
 
-                # 激活后可能已自动登录并跳转到 chat.qwen.ai，若无需登录则跳过
-                needs_login = self._needs_login(page)
-                if needs_login:
-                    self._do_login(page, creds)
-                    self._log("8. 已提交登录")
-                else:
-                    self._log("7. 激活后已自动登录，跳过登录步骤")
-
-                page.wait_for_timeout(5000)
-
-                # 确保在 chat 页（用户已登录），用于后续 OAuth 授权
-                try:
-                    if "chat.qwen.ai" not in (page.url or ""):
-                        page.goto("https://chat.qwen.ai", wait_until="domcontentloaded", timeout=15000)
-                    page.wait_for_load_state("networkidle", timeout=15000)
-                except Exception:
-                    pass
-                page.wait_for_timeout(3000)
-
-                # 9. 通过 OAuth 设备码流程获取 API token（与 openclaw onboard 一致，非网页 JWT）
-                self._log("9. 启动 OAuth 设备码流程，获取 API token...")
-                tokens = self._get_oauth_api_token(page)
-                if not tokens:
-                    self._log("9. OAuth 获取失败，请确保在授权页点击「同意」")
+                if self._check_stop():
+                    self._log("[Portal] 在启动认证前收到停止请求，放弃此次注册")
                     return False
-
-                access, refresh, expires = tokens["access"], tokens["refresh"], tokens["expires"]
-                self._log_token_debug(access, refresh, source="OAuth 设备码", fmt="API token")
-                try:
-                    validate_tokens(access, refresh, allow_same=(access == refresh), allow_api_token=True)
-                except ValueError as e:
-                    self._log(f"错误: {e}")
-                    return False
-
-                self._log("10. 正在写入 auth-profiles.json...")
-                self._writer.write_qwen_profile(access=access, refresh=refresh, expires=expires)
-                self._log("11. 已写入 auth-profiles.json")
-
-                if restart_openclaw_gateway(on_log=self._log):
-                    self._log("12. 全部完成，新账号已就绪")
-                else:
-                    self._log("12. Token 已写入，但 Gateway 重启失败，请手动执行: openclaw gateway restart")
-                # 供 qwen-rate-limit-monitor 检测成功
-                try:
-                    (Path(os.environ.get("TEMP", "")) / "qwen-register-success").touch()
-                except Exception:
-                    pass
-                return True
+                    
+                self._log("8. 启动远程管理 API 登录链接流程...")
+                ok = self._run_remote_proxy_link_auth(page, creds)
+                if ok:
+                    self._log("9. 远程认证流程完成（由 CLI Proxy API 侧维护认证文件）")
+                    return True
+                self._log("9. 远程认证流程失败")
+                return False
             except Exception as e:
                 self._log(f"错误: {e}")
                 raise
             finally:
                 browser.close()
 
+    def _run_remote_proxy_link_auth(self, page: Page, creds: QwenCredentials) -> bool:
+        """Use CLI Proxy management API to get auth URL and complete remote flow."""
+        base_url = (os.environ.get("CLI_PROXY_API_BASE_URL") or "").strip()
+        management_key = (os.environ.get("CLI_PROXY_API_KEY") or "").strip()
+        if not base_url or not management_key:
+            self._log("[ProxyLink] 缺少 CLI_PROXY_API_BASE_URL 或 CLI_PROXY_API_KEY")
+            return False
+
+        try:
+            auth_url, state = get_qwen_auth_url(base_url=base_url, management_key=management_key)
+        except Exception as e:
+            self._log(f"[ProxyLink] 获取登录链接失败: {e}")
+            return False
+
+        self._log(f"[ProxyLink] 获取登录链接成功，state={state}")
+        page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(1500)
+        self._log(f"[ProxyLink] 已打开登录链接，当前页面: {self._current_url(page)}")
+
+        self._log(f"[ProxyLink] 使用本次注册凭据执行登录: {creds.email}")
+        if self._check_stop():
+            self._log("[ProxyLink] 收到停止请求，退出")
+            return False
+            
+        self._complete_two_stage_auth(page, creds)
+
+        def on_wait() -> None:
+            self._log("[ProxyLink] 等待远程认证完成...")
+
+        ok, err = poll_auth_status(
+            base_url=base_url,
+            management_key=management_key,
+            state=state,
+            poll_interval=2.0,
+            timeout_seconds=300.0,
+            on_wait=on_wait,
+            check_stop=self._check_stop,
+        )
+        if not ok:
+            self._log(f"[ProxyLink] 认证状态失败: {err}")
+            return False
+
+        # 仅用于观测，不做本地写入。
+        try:
+            files = list_auth_files(base_url=base_url, management_key=management_key)
+            qwen_count = len([f for f in files if str((f or {}).get("provider") or "").lower() == "qwen"])
+            self._log(f"[ProxyLink] 远端可见 qwen 认证文件数: {qwen_count}")
+        except Exception as e:
+            self._log(f"[ProxyLink] 读取远端认证文件列表失败（可忽略）: {e}")
+
+        return True
+
+    def _complete_two_stage_auth(self, page: Page, creds: QwenCredentials) -> None:
+        """Handle common two-stage flow: login form -> confirmation page."""
+        login_submitted = False
+        confirm_clicked = False
+        max_rounds = 8
+
+        for round_idx in range(1, max_rounds + 1):
+            if self._check_stop():
+                self._log("[ProxyLink] 收到停止请求，放弃两阶段认证")
+                return
+                
+            self._log(
+                f"[ProxyLink][Round {round_idx}/{max_rounds}] 检查登录与确认页面，URL={self._current_url(page)}"
+            )
+            if not login_submitted:
+                login_submitted = self._try_login_on_auth_page(page, creds, round_idx)
+            else:
+                self._log(f"[ProxyLink][Round {round_idx}] 登录步骤已完成，跳过重复登录")
+
+            if self._auto_click_auth_action(page, round_idx):
+                confirm_clicked = True
+                break
+
+            self._log(f"[ProxyLink][Round {round_idx}] 未点击到确认按钮，等待页面更新后重试")
+
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+
+        if login_submitted:
+            self._log("[ProxyLink] 第一阶段登录表单已提交")
+        else:
+            self._log("[ProxyLink] 未检测到登录表单，可能已登录或页面已跳过该步骤")
+
+        if confirm_clicked:
+            self._log("[ProxyLink] 第二阶段确认按钮已点击")
+        else:
+            self._log("[ProxyLink] 未检测到确认按钮，继续轮询远程状态")
+
+    def _try_login_on_auth_page(self, page: Page, creds: QwenCredentials, round_idx: int) -> bool:
+        """Try login for auth-link page and return whether submit happened."""
+        try:
+            email_input = page.locator(
+                'input[type="email"], input[name="email"], input[placeholder*="邮箱"], input[placeholder*="电子邮箱"]'
+            ).first
+            if email_input.count() <= 0 or not email_input.is_visible():
+                self._log(f"[ProxyLink][Round {round_idx}] 未检测到可见邮箱输入框")
+                return False
+
+            self._log(f"[ProxyLink][Round {round_idx}] 检测到邮箱输入框，开始填入注册邮箱")
+            email_input.fill(creds.email)
+
+            pw_input = page.locator(
+                'input[type="password"], input[name="password"], input[placeholder*="密码"]'
+            ).first
+            if pw_input.count() > 0 and pw_input.is_visible():
+                pw_input.fill(creds.password)
+                self._log(f"[ProxyLink][Round {round_idx}] 已填入密码（长度={len(creds.password)}）")
+            else:
+                self._log(f"[ProxyLink][Round {round_idx}] 未检测到可见密码输入框")
+
+            submit = page.locator(
+                'button[type="submit"], button:has-text("登录"), button:has-text("Login"), button:has-text("继续"), button:has-text("Continue")'
+            ).first
+            if submit.count() > 0 and submit.is_visible():
+                submit.click()
+                page.wait_for_timeout(2000)
+                self._log(f"[ProxyLink][Round {round_idx}] 已提交登录表单")
+                return True
+
+            self._log(f"[ProxyLink][Round {round_idx}] 未找到可点击的登录按钮")
+        except Exception:
+            # Best-effort only; ignore form mismatch.
+            self._log(f"[ProxyLink][Round {round_idx}] 登录步骤异常，继续重试")
+            return False
+
+        return False
+
     def _do_register(self, page: Page, creds: QwenCredentials) -> None:
         """Fill and submit registration form."""
         self._log("3. 打开注册页并填写表单")
-        page.goto(self.REGISTER_URL, wait_until="domcontentloaded", timeout=30000)
+        page.goto(self.REGISTER_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
 
         # 用户名（第一个文本输入框，或 placeholder 含「用户」）
@@ -199,80 +389,13 @@ class QwenPortalRunner:
         submit.click()
         page.wait_for_timeout(3000)
 
-    def _needs_login(self, page: Page) -> bool:
-        """检查当前页是否显示登录表单（若已在 chat 页则不需要登录）。"""
-        url = page.url or ""
-        if "/auth" not in url and "chat.qwen.ai" in url:
-            return False
-        try:
-            email_input = page.locator('input[type="email"], input[name="email"]').first
-            return email_input.is_visible()
-        except Exception:
-            return False
-
-    def _do_login(self, page: Page, creds: QwenCredentials) -> None:
-        """Fill and submit login form."""
-        self._log("7. 填写登录表单")
-        if "auth" not in page.url.lower() or "register" in page.url:
-            page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
-
-        email_input = page.locator('input[type="email"], input[name="email"]').first
-        email_input.wait_for(state="visible", timeout=10000)
-        email_input.fill(creds.email)
-
-        pw_input = page.locator('input[type="password"]').first
-        pw_input.fill(creds.password)
-
-        submit = page.locator('button[type="submit"], button:has-text("登录"), button:has-text("Login")').first
-        submit.click()
-        page.wait_for_timeout(5000)
-
-    def _get_oauth_api_token(self, page: Page) -> Optional[dict[str, str | int]]:
-        """通过 OAuth 设备码流程获取 API token（在浏览器上下文中请求以通过 WAF）。"""
-        def open_url(url: str, user_code: str) -> None:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            if self._headless:
-                self._log("[OAuth] 无头模式：自动填写设备码并点击「同意」...")
-                self._auto_click_oauth_approve(page, user_code)
-            else:
-                self._log(f"请在打开的页面输入码 {user_code} 并点击「同意」")
-
-        def on_wait() -> None:
-            self._log("[OAuth] 等待用户授权...")
-
-        return run_device_code_flow(
-            open_verification_url=open_url,
-            on_wait=on_wait,
-            poll_interval=2.0,
-            timeout_seconds=300.0,
-            page_for_requests=page,
-        )
-
-    def _auto_click_oauth_approve(self, page: Page, user_code: str = "") -> None:
-        """无头模式下自动填写设备码（若需要）并点击 OAuth 授权页的「同意」按钮。"""
+    def _auto_click_auth_action(self, page: Page, round_idx: int) -> bool:
+        """Best-effort click for common approval/confirm buttons on auth page."""
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
-        page.wait_for_timeout(4000)
-
-        if user_code:
-            try:
-                for sel in [
-                    'input[placeholder*="码"]',
-                    'input[placeholder*="code"]',
-                    'input[name*="code"]',
-                    'input[placeholder*="Code"]',
-                ]:
-                    inp = page.locator(sel).first
-                    if inp.count() > 0:
-                        inp.wait_for(state="visible", timeout=2000)
-                        inp.fill(user_code)
-                        page.wait_for_timeout(1500)
-                        break
-            except Exception:
-                pass
+        page.wait_for_timeout(1000)
 
         selectors = [
             'button:has-text("同意")',
@@ -297,11 +420,11 @@ class QwenPortalRunner:
         for sel in selectors:
             try:
                 btn = page.locator(sel).first
-                btn.wait_for(state="visible", timeout=3000)
-                btn.click()
-                self._log("[OAuth] 已自动点击同意")
-                page.wait_for_timeout(2000)
-                return
+                if btn.count() > 0 and btn.is_visible(timeout=500):
+                    btn.click()
+                    self._log(f"[ProxyLink][Round {round_idx}] 已自动点击授权按钮，selector={sel}")
+                    page.wait_for_timeout(2000)
+                    return True
             except Exception:
                 continue
 
@@ -318,20 +441,9 @@ class QwenPortalRunner:
             return false;
         }""")
         if clicked:
-            self._log("[OAuth] 已自动点击同意（JS 查找）")
+            self._log(f"[ProxyLink][Round {round_idx}] 已自动点击授权按钮（JS 文本查找）")
             page.wait_for_timeout(2000)
-            return
+            return True
 
-        try:
-            path = Path(tempfile.gettempdir()) / "qwen_oauth_approve_fail.png"
-            page.screenshot(path=path)
-            self._log(f"[OAuth] 未找到同意按钮，截图已保存: {path}")
-        except Exception:
-            self._log("[OAuth] 未找到同意按钮，请检查授权页结构")
-
-    def _log_token_debug(self, access: str, refresh: str, source: str, fmt: str) -> None:
-        """打印 token 来源与格式调试信息。"""
-        jwt_flag = "JWT" if is_valid_jwt(access) else "非 JWT"
-        self._log(f"[调试] Token 来源: {source}")
-        self._log(f"[调试] Token 格式: {fmt} ({jwt_flag})")
-        self._log(f"[调试] access(len={len(access)}) refresh(len={len(refresh)})")
+        self._log(f"[ProxyLink][Round {round_idx}] 当前页面未匹配到确认/授权按钮")
+        return False
